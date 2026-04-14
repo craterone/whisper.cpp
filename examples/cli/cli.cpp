@@ -1185,6 +1185,8 @@ int main(int argc, char ** argv) {
             wparams.token_timestamps = params.output_wts || params.output_jsn_full || params.max_len > 0;
             wparams.thold_pt         = params.word_thold;
             wparams.max_len          = params.output_wts && params.max_len == 0 ? 60 : params.max_len;
+
+            printf("mydeub %d, %d\n", wparams.token_timestamps, wparams.max_len);
             wparams.split_on_word    = params.split_on_word;
             wparams.audio_ctx        = params.audio_ctx;
 

@@ -19,7 +19,7 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
     }
     
     private var sampleUrl: URL? {
-        Bundle.main.url(forResource: "jfk", withExtension: "wav", subdirectory: "samples")
+        Bundle.main.url(forResource: "foxnews", withExtension: "mp4", subdirectory: "samples")
     }
     
     private enum LoadError: Error {
@@ -101,8 +101,8 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
         
         do {
             canTranscribe = false
-            messageLog += "Reading wave samples...\n"
-            let data = try readAudioSamples(url)
+            messageLog += "Reading audio samples...\n"
+            let data = try await readAudioSamples(url)
             messageLog += "Transcribing data...\n"
             await whisperContext.fullTranscribe(samples: data)
             let text = await whisperContext.getTranscription()
@@ -115,10 +115,20 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
         canTranscribe = true
     }
     
-    private func readAudioSamples(_ url: URL) throws -> [Float] {
+    /// 读取音频采样数据
+    /// - WAV 文件：直接解码 PCM 数据（假定已经是 16kHz/mono/s16le 格式）
+    /// - 其他格式（mp4、m4a 等）：使用 AVFoundation 提取并转换音频
+    private func readAudioSamples(_ url: URL) async throws -> [Float] {
         stopPlayback()
         try startPlayback(url)
-        return try decodeWaveFile(url)
+        
+        let ext = url.pathExtension.lowercased()
+        if ext == "wav" {
+            return try decodeWaveFile(url)
+        } else {
+            messageLog += "Detected non-WAV format (\(ext)), converting audio...\n"
+            return try await convertAudioFileToWhisperSamples(url)
+        }
     }
     
     func toggleRecord() async {
