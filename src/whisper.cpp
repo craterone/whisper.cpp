@@ -6027,14 +6027,35 @@ static inline bool should_split_on_word(const char * txt, bool split_on_word) {
 }
 
 // Count UTF-8 characters (not bytes) in a string
+// Returns -1 if the string contains an incomplete UTF-8 sequence
 static int utf8_len(const char * str) {
     int count = 0;
     while (*str) {
-        // Skip continuation bytes (10xxxxxx)
-        if ((*str & 0xC0) != 0x80) {
-            count++;
+        unsigned char c = (unsigned char)*str;
+        int expected_bytes = 1;
+        
+        // Determine expected bytes for this UTF-8 character
+        if ((c & 0x80) == 0) {
+            expected_bytes = 1;  // ASCII: 0xxxxxxx
+        } else if ((c & 0xE0) == 0xC0) {
+            expected_bytes = 2;  // 110xxxxx
+        } else if ((c & 0xF0) == 0xE0) {
+            expected_bytes = 3;  // 1110xxxx
+        } else if ((c & 0xF8) == 0xF0) {
+            expected_bytes = 4;  // 11110xxx
+        } else {
+            return -1;  // Invalid UTF-8 start byte
         }
-        str++;
+        
+        // Check if we have enough bytes for a complete character
+        for (int i = 1; i < expected_bytes; i++) {
+            if (str[i] == '\0' || (((unsigned char)str[i] & 0xC0) != 0x80)) {
+                return -1;  // Incomplete UTF-8 sequence
+            }
+        }
+        
+        count++;
+        str += expected_bytes;
     }
     return count;
 }
@@ -6068,7 +6089,15 @@ static int whisper_wrap_segment(struct whisper_context & ctx, struct whisper_sta
 
         const auto txt = whisper_token_to_str(&ctx, token.id);
         const int cur = utf8_len(txt);  // Use UTF-8 character count instead of byte count
-
+        
+        // Skip tokens with incomplete UTF-8 sequences
+        if (cur < 0) {
+            // Incomplete UTF-8 sequence, add it anyway (cannot split here)
+            text += txt;
+            continue;
+        }
+        
+        // Only split at valid UTF-8 boundaries, not in the middle of incomplete sequences
         if (acc + cur > max_len && i > 0 && should_split_on_word(txt, split_on_word)) {
             state.result_all.back().text = std::move(text);
             state.result_all.back().t1 = token.t0;
