@@ -2317,7 +2317,11 @@ static struct ggml_cgraph * whisper_build_graph_cross(
         struct ggml_tensor * k;
         struct ggml_tensor * v;
 
-        if (wctx.params.flash_attn) {
+        // Use non-flash layout for cross-attention KV when DTW is enabled,
+        // since DTW needs the explicit cross-attention weights (KQ_soft_max)
+        const bool flash_cross = wctx.params.flash_attn && !wctx.params.dtw_token_timestamps;
+
+        if (flash_cross) {
             k = ggml_view_1d(ctx0, wstate.kv_cross.k, n_state*n_ctx,
                     (ggml_element_size(wstate.kv_cross.k)*n_state)*(il*n_ctx_pad));
 
@@ -2677,7 +2681,11 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                         ggml_reshape_3d(ctx0, Qcur, n_state_head, n_head, n_tokens),
                         0, 2, 1, 3);
 
-            if (wctx.params.flash_attn) {
+            // Use non-flash path for cross-attention when DTW is enabled,
+            // since DTW needs the explicit cross-attention weights (KQ_soft_max)
+            const bool flash_cross = wctx.params.flash_attn && !wctx.params.dtw_token_timestamps;
+            
+            if (flash_cross) {
                 struct ggml_tensor * Kcross =
                     ggml_view_3d(ctx0, wstate.kv_cross.k,
                             n_state_head, n_audio_ctx_pad, n_head,
@@ -3706,8 +3714,7 @@ struct whisper_context * whisper_init_with_params_no_state(struct whisper_model_
     ggml_time_init();
 
     if (params.flash_attn && params.dtw_token_timestamps) {
-        WHISPER_LOG_WARN("%s: dtw_token_timestamps is not supported with flash_attn - disabling\n", __func__);
-        params.dtw_token_timestamps = false;
+        WHISPER_LOG_INFO("%s: flash_attn with dtw - disabling flash attention for cross-attention only\n", __func__);
     }
 
     WHISPER_LOG_INFO("%s: use gpu    = %d\n", __func__, params.use_gpu);
@@ -3720,7 +3727,21 @@ struct whisper_context * whisper_init_with_params_no_state(struct whisper_model_
     whisper_context * ctx = new whisper_context;
     ctx->params = params;
 
-    if (!whisper_model_load(loader, *ctx)) {
+    // A C++ exception escaping this extern "C" function aborts non-C++ callers
+    // (Rust via whisper-rs, Go via cgo, ...). whisper_model_load can throw
+    // (std::runtime_error here; vk::SystemError from the Vulkan backend during
+    // device/buffer allocation), so funnel any throw into the existing
+    // NULL-return failure path instead of letting it cross the C ABI.
+    bool model_loaded = false;
+    try {
+        model_loaded = whisper_model_load(loader, *ctx);
+    } catch (const std::exception & e) {
+        WHISPER_LOG_ERROR("%s: exception during model load: %s\n", __func__, e.what());
+    } catch (...) {
+        WHISPER_LOG_ERROR("%s: unknown exception during model load\n", __func__);
+    }
+
+    if (!model_loaded) {
         loader->close(loader->context);
         WHISPER_LOG_ERROR("%s: failed to load model\n", __func__);
         delete ctx;
@@ -8090,6 +8111,94 @@ struct whisper_token_data whisper_full_get_token_data(struct whisper_context * c
     return ctx->state->result_all[i_segment].tokens[i_token];
 }
 
+// map a token time (centiseconds) from the VAD-processed timeline back to the original
+// audio. a token inside a speech segment is interpolated within that segment; a token that
+// falls in the silence removed between two segments snaps to the nearer boundary, so it
+// never ends up in the middle of a cut-out gap (which a single global interpolation over
+// the whole mapping table would do).
+static int64_t whisper_map_token_time_segment_aware(
+        int64_t t,
+        const std::vector<whisper_state::vad_segment_info> & segs) {
+    if (segs.empty()) {
+        return t;
+    }
+    if (t <= segs.front().vad_start) {
+        return segs.front().orig_start;
+    }
+    if (t >= segs.back().vad_end) {
+        return segs.back().orig_end;
+    }
+    for (size_t i = 0; i < segs.size(); ++i) {
+        const auto & s = segs[i];
+        if (t >= s.vad_start && t <= s.vad_end) {
+            const int64_t vd = s.vad_end - s.vad_start;
+            const int64_t od = s.orig_end - s.orig_start;
+            if (vd <= 0) {
+                return s.orig_start;
+            }
+            return s.orig_start + (t - s.vad_start) * od / vd;
+        }
+        if (i + 1 < segs.size() && t > s.vad_end && t < segs[i + 1].vad_start) {
+            const int64_t mid = (s.vad_end + segs[i + 1].vad_start) / 2;
+            return (t <= mid) ? s.orig_end : segs[i + 1].orig_start;
+        }
+    }
+    return t;
+}
+
+int64_t whisper_full_get_token_t0_from_state(struct whisper_state * state, int i_segment, int i_token) {
+    const int64_t t0 = state->result_all[i_segment].tokens[i_token].t0;
+    if (!state->has_vad_segments || state->vad_segments.empty()) {
+        return t0;
+    }
+    return whisper_map_token_time_segment_aware(t0, state->vad_segments);
+}
+
+int64_t whisper_full_get_token_t0(struct whisper_context * ctx, int i_segment, int i_token) {
+    return whisper_full_get_token_t0_from_state(ctx->state, i_segment, i_token);
+}
+
+int64_t whisper_full_get_token_t1_from_state(struct whisper_state * state, int i_segment, int i_token) {
+    const int64_t t1 = state->result_all[i_segment].tokens[i_token].t1;
+    if (!state->has_vad_segments || state->vad_segments.empty()) {
+        return t1;
+    }
+    const int64_t orig_t0 = whisper_full_get_token_t0_from_state(state, i_segment, i_token);
+    int64_t orig_t1 = whisper_map_token_time_segment_aware(t1, state->vad_segments);
+    if (orig_t1 < orig_t0 + 1) {
+        orig_t1 = orig_t0 + 1; // keep a strictly positive duration after snapping
+    }
+    return orig_t1;
+}
+
+int64_t whisper_full_get_token_t1(struct whisper_context * ctx, int i_segment, int i_token) {
+    return whisper_full_get_token_t1_from_state(ctx->state, i_segment, i_token);
+}
+
+int whisper_full_n_vad_segments_from_state(struct whisper_state * state) {
+    return (int) state->vad_segments.size();
+}
+
+int whisper_full_n_vad_segments(struct whisper_context * ctx) {
+    return (int) ctx->state->vad_segments.size();
+}
+
+int64_t whisper_full_get_vad_segment_t0_from_state(struct whisper_state * state, int i) {
+    return state->vad_segments[i].orig_start;
+}
+
+int64_t whisper_full_get_vad_segment_t0(struct whisper_context * ctx, int i) {
+    return ctx->state->vad_segments[i].orig_start;
+}
+
+int64_t whisper_full_get_vad_segment_t1_from_state(struct whisper_state * state, int i) {
+    return state->vad_segments[i].orig_end;
+}
+
+int64_t whisper_full_get_vad_segment_t1(struct whisper_context * ctx, int i) {
+    return ctx->state->vad_segments[i].orig_end;
+}
+
 float whisper_full_get_token_p_from_state(struct whisper_state * state, int i_segment, int i_token) {
     return state->result_all[i_segment].tokens[i_token].p;
 }
@@ -8412,24 +8521,86 @@ static int64_t sample_to_timestamp(int i_sample) {
 
 // a cost-function / heuristic that is high for text that takes longer to pronounce
 // obviously, can be improved
+//
+// iterate over utf-8 code points rather than raw bytes: a CJK glyph is 3 bytes, so the
+// old per-byte loop counted every Han/kana/hangul character ~3x and never matched
+// full-width punctuation, skewing how a segment's time is shared between its tokens for
+// Chinese/Japanese. full-width punctuation gets the same weight as its ASCII form and
+// pure-ASCII text decodes to the same weights as before.
 static float voice_length(const std::string & text) {
     float res = 0.0f;
 
-    for (char c : text) {
-        if (c == ' ') {
-            res += 0.01f;
-        } else if (c == ',') {
-            res += 2.00f;
-        } else if (c == '.') {
-            res += 3.00f;
-        } else if (c == '!') {
-            res += 3.00f;
-        } else if (c == '?') {
-            res += 3.00f;
-        } else if (c >= '0' && c <= '9') {
-            res += 3.00f;
+    const unsigned char * s = (const unsigned char *) text.data();
+    const size_t n = text.size();
+
+    for (size_t i = 0; i < n; ) {
+        const unsigned char c = s[i];
+        uint32_t cp = c;
+        int len = 1;
+        if (c < 0x80) {
+            len = 1;
+        } else if ((c >> 5) == 0x6) {
+            cp = c & 0x1F;
+            len = 2;
+        } else if ((c >> 4) == 0xE) {
+            cp = c & 0x0F;
+            len = 3;
+        } else if ((c >> 3) == 0x1E) {
+            cp = c & 0x07;
+            len = 4;
         } else {
-            res += 1.00f;
+            cp = c; // stray continuation / invalid lead byte
+            len = 1;
+        }
+        if (i + (size_t) len <= n) {
+            bool ok = true;
+            for (int k = 1; k < len; ++k) {
+                const unsigned char cc = s[i + k];
+                if ((cc & 0xC0) != 0x80) {
+                    ok = false;
+                    break;
+                }
+                cp = (cp << 6) | (cc & 0x3F);
+            }
+            if (!ok) {
+                cp = c;
+                len = 1;
+            }
+        } else {
+            cp = c;
+            len = 1;
+        }
+        i += (size_t) len;
+
+        switch (cp) {
+            case ' ':
+            case 0x3000: // ideographic space
+                res += 0.01f;
+                break;
+            case ',':
+            case 0xFF0C: // ，
+            case 0x3001: // 、
+            case 0xFF1B: // ；
+            case 0xFF1A: // ：
+                res += 2.00f;
+                break;
+            case '.':
+            case '!':
+            case '?':
+            case 0x3002: // 。
+            case 0xFF0E: // ．
+            case 0xFF01: // ！
+            case 0xFF1F: // ？
+            case 0x2026: // …
+                res += 3.00f;
+                break;
+            default:
+                if ((cp >= '0' && cp <= '9') || (cp >= 0xFF10 && cp <= 0xFF19)) {
+                    res += 3.00f; // half/full-width digits
+                } else {
+                    res += 1.00f; // letters, CJK ideographs, kana, hangul, ...
+                }
+                break;
         }
     }
 
