@@ -7774,9 +7774,7 @@ int whisper_full_with_state(
                     whisper_exp_compute_token_level_timestamps_dtw(
                             ctx, state, params, result_all.size() - n_segments, n_segments, seek, n_frames, 7, params.n_threads);
                     if (params.new_segment_callback) {
-                        for (int seg = (int) result_all.size() - n_segments; seg < n_segments; seg++) {
-                            params.new_segment_callback(ctx, state, seg, params.new_segment_callback_user_data);
-                        }
+                        params.new_segment_callback(ctx, state, n_segments, params.new_segment_callback_user_data);
                     }
                 }
             }
