@@ -21,10 +21,22 @@ on:
 
   pull_request:
     types: [opened, synchronize, reopened]
-    paths-ignore:
-      - 'bindings/ruby/**'        # handled by bindings-ruby.yml
-      - 'bindings/go/**'          # handled by bindings-go.yml
-      - 'examples/addon.node/**'  # handled by examples.yml
+    paths: ['.github/workflows/build-clang.yml',
+            '**/CMakeLists.txt',
+            '**/Makefile',
+            '**/*.mk',
+            '**/*.cmake',
+            '**/*.in',
+            '**/*.h',
+            '**/*.hpp',
+            '**/*.c',
+            '**/*.cpp',
+            '**/*.cu',
+            '**/*.cuh',
+            '**/*.cl',
+            '!bindings/ruby/**',
+            '!bindings/go/**',
+            '!examples/addon.node/**']
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
@@ -81,17 +93,23 @@ jobs:
               -DCMAKE_CXX_COMPILER=clang++ \
               -DCMAKE_C_COMPILER=clang \
               -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              -DGGML_NATIVE=OFF
             make
             ctest -L gh --output-on-failure'
 
   ubuntu-22-clang-arm64:
+    name: ubuntu-22-clang-arm64 (${{ matrix.build }}, backend DL ${{ matrix.backend_dl }})
     runs-on: ubuntu-22.04-arm
 
     strategy:
       fail-fast: false
       matrix:
         build: [Debug, Release]
+        backend_dl: ['OFF']
+        include:
+          - build: Debug
+            backend_dl: 'ON'
 
     steps:
       - name: Clone
@@ -100,7 +118,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: clang-arm64-${{ matrix.build }}
+          key: clang-arm64-${{ matrix.build }}-dl-${{ matrix.backend_dl }}
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
@@ -115,6 +133,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=${{ matrix.build }} \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_C_COMPILER=clang \
+            -DGGML_BACKEND_DL=${{ matrix.backend_dl }} \
             -DGGML_NATIVE=OFF \
             -DGGML_CPU_ARM_ARCH=armv8-a
           make
